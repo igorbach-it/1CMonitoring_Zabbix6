@@ -50,50 +50,76 @@ if (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
     Write-Host "Служба все еще отмечена для удаления. Попробуйте перезагрузить сервер."
 }
 
-# Определение URL и пути сохранения
-$url = "https://github.com/igorbach-it/1CMonitoring_Zabbix6/archive/refs/heads/main.zip"
-$destinationPath = "C:\Temp\1CMonitoring_Zabbix6-main.zip"
-$tempExtractPath = "C:\Temp\1CMonitoring_Zabbix6-main"
-$finalExtractPath = "C:\Windows\zabbix-agent"
+# Определение пути каталога скрипта
+$scriptPath = Split-Path -Parent -Path $MyInvocation.MyCommand.Definition
 
-# Создание временной директории, если она не существует
-if (-not (Test-Path "C:\Temp")) {
-    New-Item -Path "C:\Temp" -ItemType Directory
+# Путь назначения
+$destinationPath = "C:\Windows\zabbix-agent\1C"
+
+# Создание пути назначения, если он не существует
+if (-not (Test-Path -Path $destinationPath)) {
+    New-Item -ItemType Directory -Path $destinationPath -Force
 }
 
-# Загрузка файла
-Invoke-WebRequest -Uri $url -OutFile $destinationPath
+# Копирование всех файлов и папок из каталога скрипта в путь назначения
+Copy-Item -Path "$scriptPath\*" -Destination $destinationPath -Recurse -Force
 
-# Разархивирование файла
-Expand-Archive -Path $destinationPath -DestinationPath $tempExtractPath -Force
+Write-Host "Файлы и папки успешно скопированы в $destinationPath"
 
-# Путь к папке скриптов во временной директории
-$sourceScriptsPath = Join-Path -Path $tempExtractPath -ChildPath "1CMonitoring_Zabbix6-main\scripts"
-$destinationScriptsPath = Join-Path -Path $finalExtractPath -ChildPath "scripts"
 
-# Создание целевой директории для скриптов, если она не существует
-if (-not (Test-Path $destinationScriptsPath)) {
-    New-Item -Path $destinationScriptsPath -ItemType Directory -Force
+
+# Получение пути к службе Zabbix Agent
+$zabbixService = Get-WmiObject win32_service | Where-Object { $_.Name -like '*zabbix*' } | Select-Object -ExpandProperty PathName
+
+# Определение пути к каталогу Zabbix Agent
+if ($zabbixService -ne $null) {
+    # Удаление кавычек и аргументов из строки пути
+    $agentPath = $zabbixService -replace '"', '' -replace ' .*', ''
+    # Получение только пути к каталогу
+    $agentDirectory = [System.IO.Path]::GetDirectoryName($agentPath)
+} else {
+    Write-Host "Служба Zabbix Agent не найдена."
+    exit
 }
 
-# Копирование скриптов
-Get-ChildItem -Path $sourceScriptsPath -Recurse | ForEach-Object {
-    $targetFilePath = $_.FullName.Replace($sourceScriptsPath, $destinationScriptsPath)
-    if (-not (Test-Path (Split-Path -Path $targetFilePath -Parent))) {
-        New-Item -Path (Split-Path -Path $targetFilePath -Parent) -ItemType Directory -Force
-    }
-    Copy-Item -Path $_.FullName -Destination $targetFilePath -Force
+# Поиск файла конфигурации в каталоге службы
+$configFile = Get-ChildItem -Path $agentDirectory -Filter "*.conf" | Where-Object { $_.Name -like "zabbix_agentd*.conf" } | Select-Object -ExpandProperty FullName
+
+# Проверка наличия файла конфигурации
+if ($configFile -ne $null) {
+    $configFilePath = $configFile
+} else {
+    Write-Host "Файл конфигурации Zabbix Agent не найден."
+    exit
 }
 
-# Путь к файлам конфигурации во временной директории
-$sourceConfFilesPath = Join-Path -Path $tempExtractPath -ChildPath "1CMonitoring_Zabbix6-main"
+# Вывод используемых путей для проверки
+Write-Host "Путь к Zabbix Agent: $agentDirectory"
+Write-Host "Путь к файлу конфигурации: $configFilePath"
 
-# Копирование файлов конфигурации .conf
-Get-ChildItem -Path $sourceConfFilesPath -Filter *.conf -Recurse | ForEach-Object {
-    $targetConfFilePath = Join-Path -Path $finalExtractPath -ChildPath $_.Name
-    Copy-Item -Path $_.FullName -Destination $targetConfFilePath -Force
+# Остановка Zabbix Agent
+Stop-Service -Name "Zabbix Agent" -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 5
+
+# Загрузка содержимого файла конфигурации, с проверкой на существование файла
+if (Test-Path $configFilePath) {
+    $content = Get-Content $configFilePath -Raw
+} else {
+    Write-Host "Файл конфигурации Zabbix Agent не найден: $configFilePath"
+    exit
 }
 
-# Удаление временной директории и ZIP-файла
-Remove-Item -Path $tempExtractPath -Recurse -Force
-Remove-Item -Path $destinationPath
+# Проверка и добавление новых строк в конец файла, если они отсутствуют
+$scripts1C = "Include=.\1C\*.conf"
+$newContent = $content
+
+if ($content -and -not $content.Contains($scripts1C)) {
+    $newContent += "`r`n" + $scripts1C
+    $newContent | Set-Content $configFilePath
+    Write-Host "Обновления файла конфигурации Zabbix Agent выполнены."
+} else {
+    Write-Host "Нет необходимости обновлять файл конфигурации Zabbix Agent."
+}
+
+# Запуск Zabbix Agent
+Start-Service -Name "Zabbix Agent" -ErrorAction SilentlyContinue
